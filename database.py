@@ -4,9 +4,25 @@ import bcrypt
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from datetime import datetime
+import certifi
 
-# Load the database URL from your .env file
+# Load environment variables
 load_dotenv()
+
+# MongoDB connection configuration
+MONGO_URL = os.getenv("MONGO_URL")
+DB_NAME = os.getenv("MONGO_DB_NAME", "Celo_APIS")
+
+# 🟢 Initialize Motor Client globally for FastAPI routes to share
+client = AsyncIOMotorClient(MONGO_URL, tlsCAFile=certifi.where())
+db = client[DB_NAME]
+
+
+# 🟢 FastAPI Dependency used across route files (e.g., db=Depends(get_db))
+async def get_db():
+    """Returns the MongoDB database instance for FastAPI request injection."""
+    return db
+
 
 def hash_secret(secret: str) -> str:
     """Hashes the secret key so it is unreadable in the database."""
@@ -14,30 +30,30 @@ def hash_secret(secret: str) -> str:
     hashed = bcrypt.hashpw(secret.encode('utf-8'), salt)
     return hashed.decode('utf-8')
 
+
 async def save_new_partner():
-    mongo_url = os.getenv("MONGO_URL")
-    db_name = os.getenv("MONGO_DB_NAME", "Celo_APIS")
-    
-    if not mongo_url:
+    if not MONGO_URL:
         print("❌ ERROR: MONGO_URL not found in .env file.")
         return
 
     print("🔄 Connecting to MongoDB...")
-    client = AsyncIOMotorClient(mongo_url)
-    db = client[db_name]
     
-    # 1. The Raw Keys (What you email to the partner)
+    # Raw Keys
     raw_api_key = os.getenv("PARTNER_API_KEY")
     raw_secret_key = os.getenv("PARTNER_SECRET_KEY")
     
-    # 2. Hash the secret key for storage!
+    if not raw_api_key or not raw_secret_key:
+        print("❌ ERROR: PARTNER_API_KEY or PARTNER_SECRET_KEY missing in .env")
+        return
+    
+    # Hash secret key for safe storage
     secure_hashed_secret = hash_secret(raw_secret_key)
     
     partner_document = {
         "_id": "Jimmy_Shillingi BET",  # Unique identifier for the partner  
         "company_name": "Shillingi Bet",
-        "api_key": raw_api_key, # API Keys are public, so plain text is fine
-        "secret_key": secure_hashed_secret, # SECRET Keys MUST be hashed!
+        "api_key": raw_api_key,        # API Keys are public
+        "secret_key": secure_hashed_secret, # HASHED secret key
         "created_at": datetime.utcnow()
     }
     
@@ -56,6 +72,7 @@ async def save_new_partner():
         
     except Exception as e:
         print(f"\n❌ Failed to save partner: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(save_new_partner())

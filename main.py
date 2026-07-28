@@ -1,236 +1,297 @@
 import os
+import uuid
 import asyncio
-import bcrypt
-from datetime import datetime, timedelta
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
+import time
+from datetime import datetime
+from decimal import Decimal
+from fastapi import APIRouter, HTTPException, Depends, status, FastAPI
 from pydantic import BaseModel
-from motor.motor_asyncio import AsyncIOMotorClient
-import jwt
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
+from database import get_db
 from dotenv import load_dotenv
 
-# Web3 v7 compatibility for PoA middleware
-try:
-    from web3.middleware import geth_poa_middleware
-except ImportError:
-    from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
+# Token validation imports and logic
+from auth import get_current_user, create_access_token, verify_secret
 
 load_dotenv(override=True)
 
-# ==========================================
-# 1. DATABASE CONFIGURATION
-# ==========================================
-MONGO_URL = os.getenv("MONGO_URL")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "Celo_APIS")
+app = FastAPI()
 
-if not MONGO_URL:
-    raise ValueError("CRITICAL ERROR: MONGO_URL environment variable is missing from the .env file!")
+withdraw_lock = asyncio.Lock()
 
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[MONGO_DB_NAME]
+router = APIRouter(prefix="/api/valora", tags=["Celo Wallets (MiniPay & Valora)"])
 
-# ==========================================
-# 2. CELO WEB3 CONFIGURATION
-# ==========================================
-CELO_RPC = os.getenv("CELO_RPC_URL", "https://forno.celo.org")
-CHAIN_ID = 42220 if "forno" in CELO_RPC or "mainnet" in CELO_RPC else 44787
+# 🟢 Global Concurrency Lock (Prevents nonce collisions during simultaneous withdrawals)
 
-# 🟢 FIXED: The REAL Celo Mainnet USDC Contract Address
-USDC_ADDRESS = "0x07865c6E87B9F70255377e024ef6629E264Ec76"
-NETWORK_NAME = "Celo Mainnet"
+# 🟢 Fast Ankr RPC with a 10-second timeout to prevent hanging 
+CELO_RPC = os.getenv("CELO_RPC_URL", "https://rpc.ankr.com/celo")
+CHAIN_ID = 42220
 
-w3 = Web3(Web3.HTTPProvider(CELO_RPC))
-w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+w3 = Web3(Web3.HTTPProvider(CELO_RPC, request_kwargs={'timeout': 10}))
+w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
+# Official 40-character Celo Mainnet checksummed addresses
+ASSET_CONTRACTS = {
+    "cUSD": w3.to_checksum_address("0x765DE816845861e75A25fCA122bb6898B8B1282a".lower()), 
+    "USDC": w3.to_checksum_address("0xcebA9300f2b948710d2653dD7B07f33A8B32118C".lower()), 
+    "USDT": w3.to_checksum_address("0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e".lower())  
+}
+
+# Minimal ABI to decode transfer logs
 ERC20_ABI = [
-    {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "", "type": "bool"}], "type": "function"}
+    {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "", "type": "bool"}], "type": "function"},
+    {"anonymous": False, "inputs": [{"indexed": True, "internalType": "address", "name": "from", "type": "address"}, {"indexed": True, "internalType": "address", "name": "to", "type": "address"}, {"indexed": False, "internalType": "uint256", "name": "value", "type": "uint256"}], "name": "Transfer", "type": "event"}
 ]
 
-# ==========================================
-# 3. SECURITY & TOKEN SESSION (JWT)
-# ==========================================
-JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-mamlaka-partner-key-2026")
-JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+class VerifyRequest(BaseModel):
+    amount: float
+    tx_hash: str
+    asset: str
+    counterparty: str = ""
 
-security_scheme = HTTPBearer()
+class WithdrawReq(BaseModel):
+    identifier: str
+    amount: float
+    asset: str
 
-class PartnerAuthRequest(BaseModel):
+class DepositMemoResponse(BaseModel):
+    treasury_address: str
+    memo: str
+    network: str
+    asset: str
+
+class TokenRequest(BaseModel):
     api_key: str
     secret_key: str
 
-async def verify_token_session(credentials: HTTPAuthorizationCredentials = Depends(security_scheme)):
-    """Validates the JWT token passed by the partner in the Authorization header."""
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        partner_id: str = payload.get("sub")
-        if partner_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token session.")
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token session expired. Please generate a new one.")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token session.")
 
-# ==========================================
-# 4. APP INITIALIZATION & ROUTES
-# ==========================================
-app = FastAPI(title="Mamlaka Partner BaaS", version="1.0", description="API Gateway for Celo Liquidity")
+# ======================================
+# Auth & Token Routes
+# ======================================
 
-app.add_middleware(
-    CORSMiddleware, 
-    allow_origins=["*"], 
-    allow_credentials=True, 
-    allow_methods=["*"], 
-    allow_headers=["*"]
-)
+@router.post("/v1/auth/token")
+async def login_for_access_token_current_user(body: TokenRequest, db = Depends(get_db)):
+    """
+    Exchanges API Key & Secret Key for a 1-hour JWT Bearer Token.
+    """
+    # 1. Look up partner by api_key (plural collection name)
+    partner = await db["registered_partners"].find_one({"api_key": body.api_key})
 
-router = APIRouter(prefix="/v1", tags=["Partner Operations"])
-
-# --- SCHEMAS ---
-class WithdrawRequest(BaseModel):
-    to_address: str
-    amount: float
-    idempotency_key: str
-
-# --- ENDPOINT 1: GENERATE TOKEN SESSION ---
-@router.post("/auth/token")
-async def generate_partner_token(req: PartnerAuthRequest):
-    """Partners must exchange their API Key & Secret Key for a JWT Session Token."""
-    partner = await db["registered_partners"].find_one({"api_key": req.api_key})
-    
     if not partner:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid API Key.")
-
-    try:
-        is_valid_password = bcrypt.checkpw(
-            req.secret_key.encode('utf-8'), 
-            partner["secret_key"].encode('utf-8')
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Invalid API Key or Secret Key"
         )
-        if not is_valid_password:
-            raise HTTPException(status_code=401, detail="Unauthorized: Invalid Secret Key.")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Unauthorized: Credential verification failed.")
 
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode = {
+    # 2. Verify hashed secret key
+    if not verify_secret(body.secret_key, partner["secret_key"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Invalid API Key or Secret Key"
+        )
+
+    # 3. Create JWT payload and generate token
+    token_payload = {
         "sub": str(partner["_id"]),
-        "company": partner.get("company_name", "Unknown"),
-        "exp": expire
+        "partner_name": partner.get("partner_name"),
+        "api_key": partner.get("api_key")
     }
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    
+
+    access_token = create_access_token(token_payload)
+
     return {
-        "access_token": encoded_jwt, 
-        "token_type": "bearer", 
-        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": 7200 # in the 1 min
     }
 
-# --- ENDPOINT 2: CHECK BALANCE ---
-@router.get("/balance")
-async def check_partner_balance(session: dict = Depends(verify_token_session)):
-    partner_id = session["sub"]
-    wallet = await db["partner_wallets"].find_one({"partner_id": partner_id})
-    usdc_balance = float(wallet.get("USDC", 0.0)) if wallet else 0.0
-    
-    return {"status": "success", "company": session["company"], "asset": "USDC", "balance": usdc_balance}
 
-# --- ENDPOINT 3: DEPOSIT DETAILS ---
-@router.get("/deposit")
-async def get_deposit_instructions(session: dict = Depends(verify_token_session)):
+# ======================================
+# Celo Operational Routes
+# ======================================
+
+@router.get("/deposit-details", response_model=DepositMemoResponse)
+async def get_deposit_details():
     private_key = os.getenv("CELO_TREASURY_PK")
     if not private_key:
         treasury_address = "0x0000000000000000000000000000000000000000"
     else:
-        if not private_key.startswith("0x"): private_key = f"0x{private_key}"
+        if not private_key.startswith("0x"): 
+            private_key = f"0x{private_key}"
         account = w3.eth.account.from_key(private_key)
         treasury_address = account.address
 
-    partner_id = session["sub"]
-    partner_memo = f"MESH-{partner_id.upper()}"
-
+    memo = f"MESH-ANON-{uuid.uuid4().hex[:8].upper()}"
     return {
-        "status": "success",
-        "instructions": "Send USDC on the Celo Network to the treasury_address. MUST include the required_memo in transaction data.",
         "treasury_address": treasury_address,
-        "required_memo": partner_memo,
-        "network": NETWORK_NAME
+        "memo": memo,
+        "network": "Celo Mainnet",
+        "asset": "USDC/USDT/cUSD"
     }
 
-# --- ENDPOINT 4: WITHDRAW (PAYOUT) ---
-@router.post("/withdraw")
-async def execute_partner_withdrawal(req: WithdrawRequest, session: dict = Depends(verify_token_session)):
-    partner_id = session["sub"]
-    
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
-    if not w3.is_address(req.to_address):
-        raise HTTPException(status_code=400, detail="Invalid Celo destination address.")
+@router.post("/on-ramp/verify", status_code=201)
+async def verify_valora_deposit(req: VerifyRequest, db=Depends(get_db), current_user=Depends(get_current_user)):
+    user_id = current_user.get("_id")
 
-    # Idempotency Check (Prevents duplicate withdrawals if partner clicks twice)
-    existing_tx = await db["partner_transactions"].find_one({"idempotency_key": req.idempotency_key})
+
+    clean_tx_hash = req.tx_hash.strip().lower()
+    if req.asset not in ASSET_CONTRACTS:
+        raise HTTPException(status_code=400, detail="Unsupported Celo asset.")
+
+    existing_tx = await db["ramp_entries"].find_one({"txHash": req.tx_hash, "direction": "on"})
     if existing_tx:
-        return {"status": "success", "message": "Already processed.", "tx_hash": existing_tx["tx_hash"]}
+        raise HTTPException(status_code=409, detail="This transaction hash has already been processed.")
 
-    # 1. Check & Deduct Balance Atomically
-    wallet = await db["partner_wallets"].find_one({"partner_id": partner_id})
-    current_balance = float(wallet.get("USDC", 0.0)) if wallet else 0.0
+    def fetch_and_verify_receipt():
+        for attempt in range(3):
+            try:
+                receipt = w3.eth.get_transaction_receipt(req.tx_hash)
+                if receipt.status != 1:
+                    return False, "Transaction failed or reverted on the blockchain."
+                    
+                contract = w3.eth.contract(address=ASSET_CONTRACTS[req.asset], abi=ERC20_ABI)
+                logs = contract.events.Transfer().process_receipt(receipt)
+                
+                pk = os.getenv("CELO_TREASURY_PK")
+                if not pk:
+                    return False, "Server misconfiguration: Treasury wallet not set."
+                account = w3.eth.account.from_key(pk if pk.startswith("0x") else f"0x{pk}")
+                treasury_addr = account.address.lower()
+                
+                decimals = 18 if req.asset == "cUSD" else 6
+                expected_base_units = int(Decimal(str(req.amount)) * Decimal(10 ** decimals))
+                
+                for log in logs:
+                    if log['args']['to'].lower() == treasury_addr:
+                        if log['args']['value'] >= expected_base_units:
+                            return True, "Valid"
+                            
+                return False, f"Funds were not sent to the Treasury or amount was less than {req.amount} {req.asset}."
+                
+            except Exception as e:
+                err_str = str(e)
+                if "Connection" in err_str and attempt < 2:
+                    time.sleep(1.5)
+                    continue
+                return False, f"Blockchain query error: {err_str}"
+                
+        return False, "Failed to connect to Celo RPC after 3 attempts."
+
+    is_valid, err_msg = await asyncio.to_thread(fetch_and_verify_receipt)
     
-    if current_balance < req.amount:
-        raise HTTPException(status_code=400, detail=f"Insufficient balance. Available: {current_balance} USDC.")
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=err_msg)
 
-    await db["partner_wallets"].update_one(
-        {"partner_id": partner_id},
-        {"$inc": {"USDC": -req.amount}},
+    await db["retail_wallets"].update_one(
+        {"userId": user_id},
+        {"$inc": {req.asset: req.amount}},
         upsert=True
     )
 
-    # 2. Execute Web3 Transaction
-    private_key = os.getenv("CELO_TREASURY_PK")
-    if not private_key:
-        await db["partner_wallets"].update_one({"partner_id": partner_id}, {"$inc": {"USDC": req.amount}})
-        raise HTTPException(status_code=500, detail="Server Configuration Error: Missing Treasury Key.")
+    now = datetime.utcnow()
+    
+    await db["ramp_entries"].insert_one({
+        "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
+        "direction": "on",
+        "channel": "Opera MiniPay",
+        "fromAsset": req.asset,
+        "toAsset": req.asset,
+        "fromAmount": req.amount,
+        "toAmount": req.amount,
+        "status": "COMPLETED",
+        "userId": user_id,
+       "txHash": clean_tx_hash,
+        "counterparty": req.counterparty or "MiniPay On-Chain",
+        "date": now.strftime("%b %d, %Y"),
+        "timeAgo": "Just now",
+        "createdAt": now
+    })
+    
+    return {"status": "success", "message": f"{req.amount} {req.asset} verified on Celo and credited!"}
 
-    account = w3.eth.account.from_key(private_key if private_key.startswith("0x") else f"0x{private_key}")
+@router.post("/withdraw")
+async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_user=Depends(get_current_user)):
+    user_id = current_user.get("_id")
+
+    if req.asset not in ASSET_CONTRACTS:
+        raise HTTPException(status_code=400, detail="Unsupported Celo asset.")
+
+    user_wallet = await db["retail_wallets"].find_one({"userId": user_id})
+    current_bal = float(user_wallet.get(req.asset, 0.0)) if user_wallet else 0.0
+    
+    if current_bal < req.amount:
+        raise HTTPException(status_code=400, detail=f"Insufficient {req.asset} balance. You have {current_bal}.")
+
+    await db["retail_wallets"].update_one(
+        {"userId": user_id},
+        {"$inc": {req.asset: -req.amount}}
+    )
+
+    target_address = req.identifier.strip().lower()
+    if not w3.is_address(target_address):
+        await db["retail_wallets"].update_one({"userId": user_id}, {"$inc": {req.asset: req.amount}})
+        raise HTTPException(status_code=400, detail="Invalid Celo destination address.")
+        
+    target_address = w3.to_checksum_address(target_address)
     
     try:
-        def sync_transfer():
-            contract = w3.eth.contract(address=w3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
-            amount_base_units = int(req.amount * 1_000_000) # USDC has 6 decimals
-            nonce = w3.eth.get_transaction_count(account.address)
+        private_key = os.getenv("CELO_TREASURY_PK")
+        if not private_key:
+            raise ValueError("CELO_TREASURY_PK is missing in environment. Cannot sign transaction.")
+            
+        account = w3.eth.account.from_key(private_key if private_key.startswith("0x") else f"0x{private_key}")
+        
+        decimals = 18 if req.asset == "cUSD" else 6
+        amount_base = int(Decimal(str(req.amount)) * Decimal(10 ** decimals))
 
-            tx = contract.functions.transfer(
-                w3.to_checksum_address(req.to_address), amount_base_units
-            ).build_transaction({
+        contract = w3.eth.contract(address=ASSET_CONTRACTS[req.asset], abi=ERC20_ABI)
+        
+        def execute_tx():
+            nonce = w3.eth.get_transaction_count(account.address, 'pending')
+            tx = contract.functions.transfer(target_address, amount_base).build_transaction({
                 'chainId': CHAIN_ID,
                 'gas': 150000,
                 'gasPrice': w3.eth.gas_price,
                 'nonce': nonce,
             })
-
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key=account.key)
+            signed_tx = w3.eth.account.sign_transaction(tx, account.key)
             raw_tx = getattr(signed_tx, 'raw_transaction', getattr(signed_tx, 'rawTransaction', None))
             return w3.to_hex(w3.eth.send_raw_transaction(raw_tx))
 
-        tx_hash = await asyncio.to_thread(sync_transfer)
-
-        await db["partner_transactions"].insert_one({
-            "partner_id": partner_id,
-            "type": "WITHDRAWAL",
-            "amount": req.amount,
-            "to_address": req.to_address,
-            "tx_hash": tx_hash,
-            "idempotency_key": req.idempotency_key,
-            "timestamp": datetime.utcnow()
-        })
-
-        return {"status": "success", "message": "Withdrawal broadcasted.", "tx_hash": tx_hash}
+        async with withdraw_lock:
+            tx_hex = await asyncio.to_thread(execute_tx)
 
     except Exception as e:
-        await db["partner_wallets"].update_one({"partner_id": partner_id}, {"$inc": {"USDC": req.amount}})
-        raise HTTPException(status_code=500, detail=f"Blockchain Error: {str(e)}")
+        await db["retail_wallets"].update_one({"userId": user_id}, {"$inc": {req.asset: req.amount}})
+        raise HTTPException(status_code=502, detail=f"Blockchain transfer failed: {str(e)}")
 
+    now = datetime.utcnow()
+    
+    await db["ramp_entries"].insert_one({
+        "_id": f"TRADE_{uuid.uuid4().hex[:8].upper()}",
+        "direction": "off", 
+        "channel": "Opera MiniPay", 
+        "fromAsset": req.asset, 
+        "toAsset": req.asset,
+        "fromAmount": req.amount, 
+        "toAmount": req.amount, 
+        "rate": 1.0, 
+        "fee": 0.0,
+        "counterparty": req.identifier, 
+        "status": "COMPLETED", 
+        "txHash": tx_hex, 
+        "walletAddress": target_address,
+        "userId": user_id, 
+        "createdAt": now, 
+        "date": now.strftime("%b %d, %Y"), 
+        "timeAgo": "Just now"
+    })
+
+    return {"status": "success", "message": f"{req.amount} {req.asset} sent to your wallet!", "tx_hash": tx_hex}
+
+
+# ======================================
+# 🔑 IMPORTANT: REGISTER THE ROUTER WITH FASTAPI
+# ======================================
 app.include_router(router)
