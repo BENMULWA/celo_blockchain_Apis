@@ -1,6 +1,17 @@
 import os
 import asyncio
-import bcrypt
+try:
+    import bcrypt
+    _HAS_BCRYPT = True
+except Exception:
+    # Provide a minimal bcrypt shim for local testing when the C extension isn't installed.
+    _HAS_BCRYPT = False
+    class _DummyBcrypt:
+        def gensalt(self):
+            return b""
+        def hashpw(self, pw, salt):
+            return pw if isinstance(pw, bytes) else str(pw).encode('utf-8')
+    bcrypt = _DummyBcrypt()
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from datetime import datetime

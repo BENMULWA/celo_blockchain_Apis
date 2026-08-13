@@ -11,6 +11,8 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from database import get_db
 from dotenv import load_dotenv
 
+from cardano_usda import router as cardano_router # Import the Cardano router
+
 # Token validation imports and logic
 from auth import get_current_user, create_access_token, verify_secret
 
@@ -291,7 +293,13 @@ async def withdraw_from_valora(req: WithdrawReq, db=Depends(get_db), current_use
     return {"status": "success", "message": f"{req.amount} {req.asset} sent to your wallet!", "tx_hash": tx_hex}
 
 
+#======================================
+#Cardano Apis 
+#======================================
+
+
 # ======================================
 # 🔑 IMPORTANT: REGISTER THE ROUTER WITH FASTAPI
 # ======================================
 app.include_router(router)
+app.include_router(cardano_router)  # Register the Cardano router
