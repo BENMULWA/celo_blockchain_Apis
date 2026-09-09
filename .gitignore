@@ -1,7 +1,33 @@
+─── SECURITY & CREDENTIALS ───
+
+.env
+.env.*
+!.env.example
+*.pem
+*.ppk
+*.key
+
+─── PYTHON VIRTUAL ENVIRONMENTS ───
+
 .venv/
 venv/
+env/
 ENV/
-__pycache__/
-*.pyc
-.env
-test.py
+
+─── PYTHON CACHE FILES ───
+
+pycache/
+*.py[cod]
+*$py.class
+*.so
+
+─── OS GENERATED FILES ───
+
+.DS_Store
+Thumbs.db
+
+─── IDE & EDITOR FILES ───
+
+.vscode/
+.idea/
+*.swp
