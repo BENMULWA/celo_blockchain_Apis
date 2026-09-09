@@ -27,6 +27,7 @@ from celo.contracts import (
     to_base_units,
     w3,
 )
+from celo.idempotency import claim_idempotency_key, complete_idempotency_key, compute_request_hash, fail_idempotency_key
 from celo.ledger import adjust_balance, credit_balance, debit_balance, get_all_balances
 from celo.rates import kes_to_usd, usd_to_kes
 from celo.wallet import get_or_create_deposit_index, derive_celo_account
@@ -77,6 +78,7 @@ class WithdrawReq(BaseModel):
     asset: str
     amount: float
     destination_address: str
+    idempotency_key: Optional[str] = None
 
 
 # ======================================================================
@@ -310,6 +312,33 @@ async def withdraw(req: WithdrawReq, db=Depends(get_db), partner=Depends(get_cur
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid Celo destination address. Must be a valid 0x format.")
 
+    idempotency_key = req.idempotency_key
+    if idempotency_key:
+        request_hash = compute_request_hash(
+            external_user_id=req.external_user_id, asset=req.asset,
+            amount=req.amount, destination_address=target_address,
+        )
+        replay = await claim_idempotency_key(db, partner_id, idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+
+    try:
+        response = await _execute_withdraw(req, db, partner, partner_id, target_address)
+    except HTTPException as exc:
+        if idempotency_key:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            await fail_idempotency_key(db, partner_id, idempotency_key, detail)
+        raise
+
+    if idempotency_key:
+        await complete_idempotency_key(db, partner_id, idempotency_key, response)
+    return response
+
+
+async def _execute_withdraw(req: WithdrawReq, db, partner, partner_id: str, target_address: str) -> dict:
+    """The real withdrawal logic, separated out so the idempotency wrapper
+    above can catch any HTTPException raised anywhere in here (limit
+    rejections included) and release the idempotency key for a clean retry."""
     await log_celo_audit_event(
         db, "withdrawal_requested",
         partnerId=partner_id, externalUserId=req.external_user_id, asset=req.asset,
