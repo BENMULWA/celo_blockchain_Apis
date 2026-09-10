@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from auth import get_current_partner
 from celo.audit import log_celo_audit_event
 from celo.contracts import (
+    from_base_units,
     get_contract,
     get_treasury_account,
     get_treasury_address,
@@ -376,6 +377,38 @@ async def _execute_withdraw(req: WithdrawReq, db, partner, partner_id: str, targ
     # deposit backing it in *this* gateway's per-user balance. The per-tx and
     # daily caps above, plus withdraw_lock below, are what bound the blast
     # radius of a compromised partner credential — not a balance gate.
+    #
+    # This IS a treasury on-chain balance check, though: without it, an
+    # under-funded treasury would still sign and broadcast the transfer,
+    # which then reverts on-chain — silently taking the user's KES (already
+    # debited by the partner) while nothing arrives at their wallet. Fail
+    # loudly here instead, before anything is broadcast.
+    contract = get_contract(req.asset)
+    amount_base = to_base_units(req.amount, req.asset)
+
+    def check_treasury_liquidity():
+        treasury_address = get_treasury_address()
+        available_base = contract.functions.balanceOf(treasury_address).call()
+        if available_base < amount_base:
+            available = from_base_units(available_base, req.asset)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Treasury has insufficient {req.asset} liquidity to process this "
+                    f"withdrawal. Have: {available} {req.asset}, need: {req.amount} {req.asset}. "
+                    "Please try again later or contact support."
+                ),
+            )
+
+    try:
+        await asyncio.to_thread(check_treasury_liquidity)
+    except HTTPException:
+        await log_celo_audit_event(
+            db, "withdrawal_blocked_liquidity", partnerId=partner_id, externalUserId=req.external_user_id,
+            asset=req.asset, amount=req.amount,
+        )
+        raise
+
     try:
         account = get_treasury_account()
         if not account:
